@@ -1,0 +1,5 @@
+raw/
+*.parquet
+.venv/
+config.secret.json
+*.json
