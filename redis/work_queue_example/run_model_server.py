@@ -4,6 +4,8 @@ from keras.applications import imagenet_utils
 import numpy as np
 import settings
 import helpers
+import logger
+import logging
 import redis
 import time
 import json
@@ -11,6 +13,10 @@ import json
 import os
 
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
+
+logging.basicConfig(level=logging.INFO, datefmt="%H:%M:%S",
+	format="%(asctime)s.%(msecs)03d [%(name)s pid=%(process)d] %(message)s")
+log = logging.getLogger("worker")
 
 # connect to Redis server
 db = redis.StrictRedis(host=settings.REDIS_HOST,
@@ -20,15 +26,16 @@ def classify_process():
 	# load the pre-trained Keras model (here we are using a model
 	# pre-trained on ImageNet and provided by Keras, but you can
 	# substitute in your own networks just as easily)
-	print("* Loading model...")
+	log.info("loading model")
 	model = ResNet50(weights="imagenet")
-	print("* Model loaded")
+	log.info("model loaded, waiting for jobs on '%s'", settings.IMAGE_QUEUE)
 
 	# continually pool for new images to classify
 	while True:
-		# attempt to grab a batch of images from the database, then
-		# initialize the image IDs and batch of images themselves
-		queue = db.lrange(settings.IMAGE_QUEUE, 0, settings.BATCH_SIZE - 1)
+		# atomically claim a batch of images from the database (LPOP removes
+		# them in the same step, so no other worker can get the same ones),
+		# then initialize the image IDs and batch of images themselves
+		queue = db.lpop(settings.IMAGE_QUEUE, settings.BATCH_SIZE) or []
 		imageIDs = []
 		batch = None
 
@@ -55,9 +62,16 @@ def classify_process():
 		# check to see if we need to process the batch
 		if len(imageIDs) > 0:
 			# classify the batch
-			print("* Batch size: {}".format(batch.shape))
+			log.info("popped %d job(s): %s", len(imageIDs),
+				", ".join(i[:8] for i in imageIDs))
+			logger.log("popped {} job(s): {}".format(len(imageIDs),
+				", ".join(i[:8] for i in imageIDs)))
+			start = time.time()
 			preds = model.predict(batch)
 			results = imagenet_utils.decode_predictions(preds)
+			log.info("classified batch %s in %.2fs", batch.shape,
+				time.time() - start)
+			logger.log("classified batch of {}".format(len(imageIDs)))
 
 			# loop over the image IDs and their corresponding set of
 			# results from our model
@@ -74,9 +88,10 @@ def classify_process():
 				# store the output predictions in the database, using
 				# the image ID as the key so we can fetch the results
 				db.set(imageID, json.dumps(output))
-
-			# remove the set of images from our queue
-			db.ltrim(settings.IMAGE_QUEUE, len(imageIDs), -1)
+				log.info("job %s result saved (top: %s %.4f)", imageID[:8],
+					output[0]["label"], output[0]["probability"])
+				logger.log("job {} result saved (top: {})".format(
+					imageID[:8], output[0]["label"]))
 
 		# sleep for a small amount
 		time.sleep(settings.SERVER_SLEEP)

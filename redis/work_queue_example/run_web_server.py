@@ -6,17 +6,26 @@ from PIL import Image
 import numpy as np
 import settings
 import helpers
+import logger
 import flask
 import redis
+import logging
 import uuid
 import time
 import json
 import io
 
+logging.basicConfig(level=logging.INFO, datefmt="%H:%M:%S",
+	format="%(asctime)s.%(msecs)03d [%(name)s pid=%(process)d] %(message)s")
+log = logging.getLogger("web")
+
 # initialize our Flask application and Redis server
 app = flask.Flask(__name__)
 db = redis.StrictRedis(host=settings.REDIS_HOST,
 	port=settings.REDIS_PORT, password=settings.REDIS_PASSWORD, db=settings.REDIS_DB)
+
+# seconds to wait for the worker's result notification before giving up
+RESULT_TIMEOUT = 30
 
 def prepare_image(image, target):
 	# if the image mode is not RGB, convert it
@@ -61,33 +70,60 @@ def predict():
 			k = str(uuid.uuid4())
 			image = helpers.base64_encode_image(image)
 			d = {"id": k, "image": image}
-			db.rpush(settings.IMAGE_QUEUE, json.dumps(d))
 
-			# keep looping until our model server returns the output
-			# predictions
-			while True:
-				# attempt to grab the output predictions
-				output = db.get(k)
+			# subscribe to keyspace events for our result key BEFORE
+			# pushing the work, otherwise the worker could finish and
+			# the notification would fire before we were listening
+			p = db.pubsub(ignore_subscribe_messages=True)
+			p.subscribe("__keyspace@{}__:{}".format(settings.REDIS_DB, k))
+			start = time.time()
+			queue_len = db.rpush(settings.IMAGE_QUEUE, json.dumps(d))
+			log.info("job %s pushed (queue length now %d)", k[:8], queue_len)
+			logger.log("job {} pushed (queue length now {})".format(
+				k[:8], queue_len))
 
-				# check to see if our model has classified the input
-				# image
-				if output is not None:
-					# add the output predictions to our data
-					# dictionary so we can return it to the client
-					output = output.decode("utf-8")
-					data["predictions"] = json.loads(output)
+			# block until Redis tells us the worker SET our key (or we
+			# time out), instead of polling
+			notified = False
+			try:
+				deadline = start + RESULT_TIMEOUT
+				while time.time() < deadline:
+					message = p.get_message(
+						timeout=max(0, deadline - time.time()))
+					if message is not None and message["data"] == b"set":
+						notified = True
+						break
+			finally:
+				p.close()
 
-					# delete the result from the database and break
-					# from the polling loop
-					db.delete(k)
-					break
+			if notified:
+				log.info("job %s result notification received after %.2fs",
+					k[:8], time.time() - start)
+				logger.log("job {} result notification received".format(k[:8]))
+			else:
+				log.warning("job %s no notification after %.2fs",
+					k[:8], time.time() - start)
+				logger.log("job {} no notification (timed out)".format(k[:8]))
 
-				# sleep for a small amount to give the model a chance
-				# to classify the input image
-				time.sleep(settings.CLIENT_SLEEP)
+			# the notification only says the key was set, so fetch the
+			# result once (this also covers a missed notification)
+			output = db.get(k)
+			if output is not None:
+				# add the output predictions to our data
+				# dictionary so we can return it to the client
+				data["predictions"] = json.loads(output.decode("utf-8"))
 
-			# indicate that the request was a success
-			data["success"] = True
+				# delete the result from the database and indicate that
+				# the request was a success
+				db.delete(k)
+				data["success"] = True
+				log.info("job %s result returned to client (%.2fs total)",
+					k[:8], time.time() - start)
+				logger.log("job {} result returned to client".format(k[:8]))
+			else:
+				log.error("job %s FAILED: no result in Redis, returning "
+					"success=false", k[:8])
+				logger.log("job {} FAILED: no result in Redis".format(k[:8]))
 
 	# return the data dictionary as a JSON response
 	return flask.jsonify(data)
@@ -95,5 +131,5 @@ def predict():
 # for debugging purposes, it's helpful to start the Flask testing
 # server (don't use this for production
 if __name__ == "__main__":
-	print("* Starting web service...")
+	log.info("starting web service")
 	app.run()

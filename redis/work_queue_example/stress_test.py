@@ -3,8 +3,14 @@
 
 # import the necessary packages
 from threading import Thread
+import logging
 import requests
+import logger
 import time
+
+logging.basicConfig(level=logging.INFO, datefmt="%H:%M:%S",
+    format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s")
+log = logging.getLogger("stress")
 
 # initialize the Keras REST API endpoint URL along with the input
 # image path
@@ -24,11 +30,15 @@ def call_predict_endpoint(n):
     payload = {"image": image}
 
     # submit the request
+    log.info("request %d sent", n)
+    logger.log("request {} sent".format(n))
+    start = time.time()
     r = requests.post(KERAS_REST_API_URL, files=payload).json()
 
     # ensure the request was sucessful
     if r["success"]:
-        print("[INFO] thread {} OK".format(n))
+        log.info("request %d OK after %.2fs", n, time.time() - start)
+        logger.log("request {} OK".format(n))
 
         # loop over the predictions and display them
         for (i, result) in enumerate(r["predictions"]):
@@ -37,16 +47,20 @@ def call_predict_endpoint(n):
 
     # otherwise, the request failed
     else:
-        print("[INFO] thread {} FAILED".format(n))
+        log.error("request %d FAILED after %.2fs", n, time.time() - start)
+        logger.log("request {} FAILED".format(n))
 
 # loop over the number of threads
+threads = []
 for i in range(0, NUM_REQUESTS):
     # start a new thread to call the API
     t = Thread(target=call_predict_endpoint, args=(i,))
-    t.daemon = True
     t.start()
+    threads.append(t)
     time.sleep(SLEEP_COUNT)
 
-# insert a long sleep so we can wait until the server is finished
-# processing the images
-time.sleep(300)
+# wait for every request to finish before exiting
+for t in threads:
+    t.join()
+log.info("all %d requests finished", NUM_REQUESTS)
+logger.log("all {} requests finished".format(NUM_REQUESTS))
